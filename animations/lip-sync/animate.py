@@ -12,12 +12,24 @@ UP = 2  # supersample characters
 random.seed(7)
 
 # ---------- character data (native cutout coords) ----------
-CHARS = [
-    dict(file="char1.png", mouth=(187, 157), mw=44, tilt=0,
-         eyes=[(158, 107, 24, 12), (215, 107, 24, 12)], face=(187, 120)),
-    dict(file="char2.png", mouth=(250, 192), mw=38, tilt=6,
-         eyes=[(233, 138, 22, 9), (283, 145, 18, 8)], face=(255, 150)),
-]
+import json
+LM = json.load(open(f"{S}/landmarks.json"))
+EYE_L = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+EYE_R = [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466]
+LOW_L, LOW_R = [33, 7, 163, 144, 145, 153, 154, 155, 133], [263, 249, 390, 373, 374, 380, 381, 382, 362]
+CHARS = []
+for i, f in ((1, "char1.png"), (2, "char2.png")):
+    P = np.array(LM[str(i)])
+    l, r = P[61], P[291]
+    CHARS.append(dict(
+        file=f,
+        mouth=tuple((P[13] + P[14]) / 2),
+        mw=float(np.linalg.norm(r - l)),
+        tilt=math.degrees(math.atan2(r[1] - l[1], r[0] - l[0])),
+        chin=float(np.linalg.norm(P[152] - (P[13] + P[14]) / 2)),
+        eyes=[(P[EYE_L], P[LOW_L], P[159], P[145]), (P[EYE_R], P[LOW_R], P[386], P[374])],
+        face=tuple(P.mean(axis=0)),
+    ))
 
 # Rhubarb shape -> (jaw open, width factor, teeth, tongue)
 SHAPES = {
@@ -35,7 +47,7 @@ def smooth(e0, e1, x):
 def make_variant(base, c, shape, blink):
     img = base.copy()
     h, w = img.shape[:2]
-    cx, cy = c["mouth"][0] * UP, c["mouth"][1] * UP
+    cx, cy = float(c["mouth"][0]) * UP, float(c["mouth"][1]) * UP
     MW = c["mw"] * UP
     op, wf, teeth, tongue = SHAPES[shape]
     d = op * MW * 0.45
@@ -46,11 +58,12 @@ def make_variant(base, c, shape, blink):
         lx = (xx - cx) * math.cos(a) + (yy - cy) * math.sin(a)
         ly = -(xx - cx) * math.sin(a) + (yy - cy) * math.cos(a)
         wx = 1 - smooth(0.55 * MW, 1.25 * MW, np.abs(lx))
-        wy = smooth(-0.06 * MW, 0.10 * MW, ly) * (1 - smooth(0.9 * MW, 1.9 * MW, ly))
+        CH = c['chin'] * UP
+        wy = smooth(-0.06 * MW, 0.10 * MW, ly) * (1 - smooth(0.85 * CH, 1.6 * CH, ly))
         wgt = wx * wy
         mx = xx - d * wgt * math.sin(a) * -1
         my = yy - d * wgt * math.cos(a)
-        img = cv2.remap(img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        img = cv2.remap(img, mx.astype(np.float32), my.astype(np.float32), cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         # mouth interior
         ccx = cx - d / 2 * math.sin(a)
         ccy = cy + d / 2 * math.cos(a)
@@ -91,19 +104,27 @@ def make_variant(base, c, shape, blink):
         pass
     if blink:
         rgb = img[..., :3].astype(np.float32)
-        for (ex, ey, ew, eh) in c["eyes"]:
-            ex, ey, ew, eh = ex * UP, ey * UP, ew * UP, eh * UP
-            # skin colour from just above the eye
-            patch = img[int(ey + eh * 1.1):int(ey + eh * 1.7), int(ex - ew * 0.3):int(ex + ew * 0.3), :3]
-            col = np.median(patch.reshape(-1, 3), axis=0).astype(np.float32) * 0.88
+        for (poly, lower, up, lo) in c["eyes"]:
+            poly, lower, up, lo = poly * UP, lower * UP, up * UP, lo * UP
+            eh = max(2.0, np.linalg.norm(lo - up))
+            # lid colour: skin just above the upper lid
+            px, py = int(lo[0]), int(lo[1] + eh * 1.3)
+            patch = img[py - 2:py + 3, px - 4:px + 5, :3].reshape(-1, 3)
+            col = np.median(patch, axis=0).astype(np.float32) * 0.93
             m = np.zeros(rgb.shape[:2], np.float32)
-            cv2.ellipse(m, (int(ex), int(ey)), (int(ew * 0.62), int(eh * 0.85)), c["tilt"], 0, 360, 1.0, -1, cv2.LINE_AA)
-            m = cv2.GaussianBlur(m, (0, 0), 1.6)
+            if blink == 1:  # half closed: cover top half of eye
+                cut = (up[1] + lo[1]) / 2
+                pts = np.array([[x, min(y, cut + (y - up[1]) * 0.0)] if y > cut else [x, y] for x, y in poly])
+                cv2.fillPoly(m, [pts.astype(np.int32)], 1.0, cv2.LINE_AA)
+            else:
+                cv2.fillPoly(m, [poly.astype(np.int32)], 1.0, cv2.LINE_AA)
+            m = cv2.GaussianBlur(cv2.dilate(m, np.ones((3, 3))), (0, 0), 1.3)
             rgb = rgb * (1 - m[..., None]) + col * m[..., None]
-            l = np.zeros(rgb.shape[:2], np.float32)
-            cv2.ellipse(l, (int(ex), int(ey + eh * 0.25)), (int(ew * 0.58), int(eh * 0.35)), c["tilt"], 20, 160, 1.0, 2, cv2.LINE_AA)
-            l = cv2.GaussianBlur(l, (0, 0), 0.8) * 0.75
-            rgb = rgb * (1 - l[..., None]) + np.array([40, 25, 20], np.float32) * l[..., None]
+            if blink == 2:
+                lash = np.zeros(rgb.shape[:2], np.float32)
+                cv2.polylines(lash, [lower.astype(np.int32)], False, 1.0, max(2, int(eh * 0.25)), cv2.LINE_AA)
+                lash = cv2.GaussianBlur(lash, (0, 0), 0.9) * 0.8
+                rgb = rgb * (1 - lash[..., None]) + np.array([35, 22, 18], np.float32) * lash[..., None]
         img[..., :3] = np.clip(rgb, 0, 255).astype(np.uint8)
     return img
 
@@ -113,9 +134,9 @@ for c in CHARS:
     im = im.resize((im.width * UP, im.height * UP), Image.LANCZOS)
     base = np.array(im)
     c["size"] = (base.shape[1], base.shape[0])
-    c["var"] = {(s, b): make_variant(base, c, s, b) for s in SHAPES for b in (0, 1)}
+    c["var"] = {(s, b): make_variant(base, c, s, b) for s in SHAPES for b in (0, 1, 2)}
     if PREVIEW:
-        sheet = np.concatenate([c["var"][(s, 0)][: int(c["mouth"][1] * UP * 1.6), :, :3] for s in "XBCDEFGH"] + [c["var"][("X", 1)][: int(c["mouth"][1] * UP * 1.6), :, :3]], axis=1)
+        sheet = np.concatenate([c["var"][(s, 0)][: int(c["mouth"][1] * UP * 1.6), :, :3] for s in "XBCDEFGH"] + [c["var"][("X", 1)][: int(c["mouth"][1] * UP * 1.6), :, :3], c["var"][("X", 2)][: int(c["mouth"][1] * UP * 1.6), :, :3]], axis=1)
         Image.fromarray(sheet).save(f"{S}/sheet_{c['file']}")
 if PREVIEW:
     sys.exit()
@@ -195,11 +216,11 @@ for i, (a, b, ch) in enumerate(scenes):
     plans.append([(a, mid, seq[0]), (mid, b, seq[1])] if b - a > 6 else [(a, b, seq[0])])
 
 # blinks
-blinks = set()
+blinks = {}
 t = 1.2
 while t < dur:
     f0 = int(t * FPS)
-    blinks.update(range(f0, f0 + 4))
+    blinks.update({f0: 1, f0 + 1: 2, f0 + 2: 2, f0 + 3: 1})
     t += random.uniform(2.4, 5.0)
 
 CHAR_H = 1450  # world px height of character in wide shot
@@ -252,7 +273,7 @@ def frame_at(f):
     zoom = FRAMINGS[shot[2]]
     prog = (t - shot[0]) / max(0.1, shot[1] - shot[0])
     push = 1 + 0.06 * prog  # slow push-in
-    var = c["var"][(shape_at(t), 1 if f in blinks else 0)]
+    var = c["var"][(shape_at(t), blinks.get(f, 0))]
     # compute face focus with neutral world (approx)
     cw, chh = c["size"]
     s0 = CHAR_H / chh
